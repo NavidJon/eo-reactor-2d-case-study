@@ -1,4 +1,3 @@
-from functools import partial
 import cupy as cp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -79,13 +78,13 @@ radial_cell_center_position = cp.linspace(
     radial_cell_size / 2, 
     Reactor.radius - radial_cell_size / 2, 
     number_radial_cells,
-    data_type=data_type
+    dtype=data_type
 )
 axial_cell_center_position = cp.linspace(
     axial_cell_size / 2,
     Reactor.height - axial_cell_size / 2,
     number_axial_cells,
-    data_type=data_type
+    dtype=data_type
 )
 
 # =========================
@@ -93,13 +92,8 @@ axial_cell_center_position = cp.linspace(
 # =========================
 time_final = 20
 number_of_time_steps = 20000
-time_step_size = data_type(time_final / number_of_steps)
+time_step_size = data_type(time_final / number_of_time_steps)
 
-# =========================
-# Mass transport properties
-# =========================
-diffusivity = data_type(1.5e-5)   # [m^2/s]
-pressure = data_type(1.0e5)    # [Pa]
 
 # =========================
 # Reaction properties
@@ -140,6 +134,7 @@ class Gas:
     specific_heat_capacity = data_type(1000.0)
     thermal_conductivity = data_type(0.1)
     thermal_diffusivity = data_type(thermal_conductivity / (density * specific_heat_capacity))  # [m^2/s]
+    mass_diffusivity = data_type(1.5e-5)   # [m^2/s]
 
 # =========================
 # Energy balance parameters
@@ -837,7 +832,7 @@ heat_transfer_sink_coefficient = Reactor.heat_transfer_coefficient / volumetric_
 # Macro-step main loop
 # -------------------------
 simulation_start_time = pytime.time()
-LOG_EVERY = max(1, n_macro // 1)
+LOG_EVERY = max(1, number_of_macro_steps // 1)
 RECOMP_TOL  = 1e-4  # recompute Ergun when Tz changes
 
 previous_axial_average_temperature_profile = axial_average_temperature_profile
@@ -868,7 +863,7 @@ for macro_step_index in range(number_of_macro_steps):
         )
     )
 
-    if relative_temperature_change > temperature_change_tolerance:
+    if relative_temperature_change > RECOMP_TOL:
         axial_dynamic_viscosity_profile = (
             data_type(Gas.dynamic_viscosity)
             * (axial_average_temperature_profile / data_type(Gas.inlet_temperature))
@@ -908,7 +903,7 @@ for macro_step_index in range(number_of_macro_steps):
 
     remaining_substeps = SUB_STEPS
     while remaining_substeps > 0:
-        number_of_substeps_this_call = min(CHUNK_STEPS, remaining)
+        number_of_substeps_this_call = min(CHUNK_STEPS, remaining_substeps)
 
         macro_step(
             blocks_per_grid,
@@ -933,34 +928,33 @@ for macro_step_index in range(number_of_macro_steps):
                 axial_cell_size,
                 substep_time_step,
 
-                # substep-scaled transport coefficients
                 thermal_diffusivity_time_over_radial_cell_size_squared,
                 half_thermal_diffusivity_time_over_radial_cell_size,
                 thermal_diffusivity_time_over_axial_cell_size_squared,
                 substep_time_over_axial_cell_size,
                 heat_transfer_sink_coefficient_time,
 
-                # diffusion & kinetics constants
-                Catalyst.weight,
-                mass_diffusivity,
+                Gas.mass_diffusivity,
                 Gas.inlet_temperature,
                 Gas.inlet_pressure,
-                Gas.ideal_gas_constant,
 
                 Main_Reaction.KE1,
-                Main_Reaction.n1,
-                Main_Reaction.k01,
-                Main_Reaction.Ea1,
-                Main_Reaction.dH1,
-
                 Side_Reaction.KE2,
+                Main_Reaction.n1,
                 Side_Reaction.n2,
+                Main_Reaction.k01,
                 Side_Reaction.k02,
+                Main_Reaction.Ea1,
                 Side_Reaction.Ea2,
+
+                Gas.ideal_gas_constant,
+                Catalyst.weight,
+
+                Main_Reaction.dH1,
                 Side_Reaction.dH2,
-                # energy source and cooling pieces
+
                 volumetric_heat_capacity,
-                coolant_temperature
+                coolant_temperature,
             )
         )
 
@@ -978,7 +972,7 @@ for macro_step_index in range(number_of_macro_steps):
         # Apply BC at each chunk
         current_species_concentration_field[:, 0, :]  = current_species_concentration_field[:, 1, :]
         current_species_concentration_field[:, -1, :] = current_species_concentration_field[:, -2, :]
-        current_species_concentration_field[:, :,  0] = Species.initial_concentration[:, None]
+        current_species_concentration_field[:, :,  0] = Species.inlet_concentrations[:, None]
         current_species_concentration_field[:, :, -1] = current_species_concentration_field[:, :, -2]
 
         current_temperature_field[0, :]  = current_temperature_field[1, :]
@@ -996,7 +990,7 @@ for macro_step_index in range(number_of_macro_steps):
             cp.mean(current_temperature_field[:, -1])
         )
         
-        elapsed_simulation_time = pytime.time() - current_temperature_field
+        elapsed_simulation_time = pytime.time() - simulation_start_time
         
         completed_fraction = (macro_step_index + 1) / number_of_macro_steps
         
