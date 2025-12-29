@@ -10,356 +10,725 @@ import time as pytime
 PROFILE = False
 
 class GPUTimer:
-    def __init__(self): self.t = {}
-    def tick(self, key):
-        if not PROFILE: return
-        s = cp.cuda.Event(); e = cp.cuda.Event()
-        s.record(); self.t[key] = [s, e]
-    def tock(self, key, acc):
-        if not PROFILE: return
-        s, e = self.t[key]
-        e.record(); e.synchronize()
-        ms = cp.cuda.get_elapsed_time(s, e)  # milliseconds
-        acc[key] = acc.get(key, 0.0) + ms
+    def __init__(self): 
+        self.t = {}
 
-class NoOpTimer:
-    def tick(self, *a, **k): pass
-    def tock(self, *a, **k): pass
+    def start_timing(self, section_name):
+        if not PROFILE: 
+            return
+        start_event = cp.cuda.Event()
+        stop_event = cp.cuda.Event()
 
-timer = GPUTimer() if PROFILE else NoOpTimer()
-tim_acc = {}
+        start_event.record()
+        self.t[section_name] = [start_event, stop_event]
+
+    def stop_timing(self, section_name, accumulated_time):
+        if not PROFILE: 
+            return
+        start_event, stop_event = self.t[section_name]
+        stop_event.record()
+        stop_event.synchronize()
+        elapsed_time = cp.cuda.get_elapsed_time(start_event, stop_event)  # milliseconds
+        accumulated_time[section_name] = accumulated_time.get(section_name, 0.0) + elapsed_time
+
+class NoOperationTimer:
+    def start_timing(self, *a, **k):
+        pass
+    def stop_timing(self, *a, **k):
+        pass
+
+timer = GPUTimer() if PROFILE else NoOperationTimer()
+elapsed_time_accumulator = {}
 
 # =========================
-# Precision for GPU calculations
+# Precision for GPU calculations 
 # =========================
-DTYPE = cp.float32
+data_type = cp.float32
 cp.cuda.runtime.setDevice(0)
-if DTYPE == cp.float32:
-    IN_DTYPE = 'float32'   # for Elementwise/RawKernel signatures
-    CUDTYPE  = 'float'     # for CUDA device code
-elif DTYPE == cp.float64:
-    IN_DTYPE = 'float64'
-    CUDTYPE  = 'double'
+if data_type == cp.float32:
+    input_data_type = 'float32'   # for Elementwise/RawKernel signatures
+    cuda_data_type  = 'float'     # for CUDA device code
+elif data_type == cp.float64:
+    input_data_type = 'float64'
+    cuda_data_type  = 'double'
 else:
-    raise ValueError("DTYPE must be cp.float32 or cp.float64")
+    raise ValueError("Must be 32 or 64")
 
 # =========================
 # Reactor Tube Geometry
 # =========================
-reactor_scale = 10
-radius = 0.001 * reactor_scale
-height = 1 * reactor_scale
+class Reactor:
+    reactor_scale = 10
+    radius = 0.001 * reactor_scale
+    height = 1.0 * reactor_scale
+    void_fraction = data_type(0.40)
+    heat_transfer_coefficient = data_type(200.0)  # [W/m^3/K]
 
 # =========================
 # Grid Mesh
 # =========================
 mesh_scale = 40
-nr, nz = 1*mesh_scale, 10*mesh_scale
-dr, dz = DTYPE(radius / nr), DTYPE(height / nz)
-r = cp.linspace(dr / 2, radius - dr / 2, nr, dtype=DTYPE)
-z = cp.linspace(dz / 2, height - dz / 2, nz, dtype=DTYPE)
+
+number_radial_cells = 1 * mesh_scale
+number_axial_cells = 10 * mesh_scale
+
+radial_cell_size = data_type(Reactor.radius / number_radial_cells)
+axial_cell_size = data_type(Reactor.height / number_axial_cells)
+
+radial_cell_center_position = cp.linspace(
+    radial_cell_size / 2, 
+    Reactor.radius - radial_cell_size / 2, 
+    number_radial_cells,
+    data_type=data_type
+)
+axial_cell_center_position = cp.linspace(
+    axial_cell_size / 2,
+    Reactor.height - axial_cell_size / 2,
+    number_axial_cells,
+    data_type=data_type
+)
 
 # =========================
 # Time Stepping
 # =========================
 time_final = 20
-number_of_steps = 20000
-dt = DTYPE(time_final / number_of_steps)
+number_of_time_steps = 20000
+time_step_size = data_type(time_final / number_of_steps)
 
 # =========================
 # Mass transport properties
 # =========================
-D_REF = DTYPE(1.5e-5)   # [m^2/s]
-p_ref = DTYPE(1.0e5)    # [Pa]
+diffusivity = data_type(1.5e-5)   # [m^2/s]
+pressure = data_type(1.0e5)    # [Pa]
 
 # =========================
-# Kinetic properties
+# Reaction properties
 # =========================
-inlet_reference_temperature = DTYPE(450)  # [K]
-ideal_gas_constant = DTYPE(8.314)
-KE1, KE2 = DTYPE(6.5), DTYPE(4.33)
-k01, k02 = DTYPE(1.33e5), DTYPE(1.80e6)
-n1,  n2  = DTYPE(0.58),  DTYPE(0.30)
-Ea1, Ea2 = DTYPE(60.7e3), DTYPE(73.2e3)
+class Main_Reaction:
+    KE1 = data_type(6.5)
+    k01 = data_type(1.33e5)
+    n1 = data_type(0.58)
+    Ea1 = data_type(60.7e3)
+    dH1 = data_type(-105e3); 
+
+class Side_Reaction:
+    KE2 = data_type(4.33)
+    k02 = data_type(1.80e6)
+    n2  = data_type(0.30)
+    Ea2 = data_type(73.2e3)
+    dH2 = data_type(-1327e3)
 
 # =========================
-# Ergun equation parameters
+# Catalyst parameters
 # =========================
-void_fraction = DTYPE(0.40)
-catalyst_particle_diameter = DTYPE(3.0e-2)
-catalyst_density = DTYPE(1200)
-catalyst_weight  = catalyst_density * (1-void_fraction)
-mu_ref = DTYPE(3.0e-5)
-pressure_inlet = DTYPE(10.0e5)
-U_in  = DTYPE(0.5)
+class Catalyst:
+    particle_diameter = data_type(3.0e-2)
+    density = data_type(1200)
+    weight  = density * (1-Reactor.void_fraction)
+    specific_heat_capacity = data_type(900.0)
 
-# Species molecular weights (kg/mol)
-molecular_weight = cp.asarray([0.028, 0.032, 0.044, 0.018, 0.044, 0.016], dtype=DTYPE)
+# =========================
+# Gas parameters
+# =========================
+class Gas:
+    ideal_gas_constant = data_type(8.314)
+    dynamic_viscosity = data_type(3.0e-5)
+    inlet_pressure = data_type(10.0e5)
+    inlet_temperature = data_type(450)  # [K]
+    inlet_superficial_velocity = data_type(0.5)
+    density = data_type(1.0)
+    specific_heat_capacity = data_type(1000.0)
+    thermal_conductivity = data_type(0.1)
+    thermal_diffusivity = data_type(thermal_conductivity / (density * specific_heat_capacity))  # [m^2/s]
 
 # =========================
 # Energy balance parameters
 # =========================
-effective_gas_density = DTYPE(1.0)
-effective_gas_specific_heat_capacity  = DTYPE(1000.0)
-effective_gas_thermal_conductivity    = DTYPE(0.1)
-alpha = DTYPE(effective_gas_thermal_conductivity /
-              (effective_gas_density * effective_gas_specific_heat_capacity))  # [m^2/s]
+coolant_temperature = data_type(300.0)                   # [K]
 
-volumetric_heat_transfer_coefficient = DTYPE(200.0)  # [W/m^3/K]
-coolant_temperature = DTYPE(300.0)                   # [K]
-dH1 = DTYPE(-105e3); dH2 = DTYPE(-1327e3)
 
 # =========================
 # Precompute geometric factors
 # =========================
-r_mid = r[1:-1][None, :, None]          # (1, nr-2, 1)
-inv_r_mid = DTYPE(1.0) / r_mid          # (1, nr-2, 1)
-inv_r_mid_T = inv_r_mid[0]              # (nr-2, 1)
+interior_radial_cell_center_position = radial_cell_center_position[1:-1][None, :, None]          # (1, number_radial_cells-2, 1)
+inverse_interior_radial_cell_center_position = data_type(1.0) / interior_radial_cell_center_position          # (1, number_radial_cells-2, 1)
+inverse_interior_radial_cell_center_position_line = inverse_interior_radial_cell_center_position[0]              # (number_radial_cells-2, 1)
 
 # =========================
 # Species setup
 # =========================
-species_names = ['Ethylene','Oxygen','Ethylene Oxide','Water','Carbon Dioxide','Methane']
-n_species = len(species_names)
-initial_vals = cp.asarray([2.0, 6.0, 0.0, 0.0, 0.0, 8.0], dtype=DTYPE)
-dirichlet_inlet = cp.asarray([2.0, 6.0, 0.0, 0.0, 0.0, 8.0], dtype=DTYPE)
+class Species:
+    names = ['Ethylene','Oxygen','Ethylene Oxide','Water','Carbon Dioxide','Methane']
+    count = len(names)
+    initial_concentration = cp.asarray([2.0, 6.0, 0.0, 0.0, 0.0, 8.0], dtype=data_type)
+    inlet_concentrations = cp.asarray([2.0, 6.0, 0.0, 0.0, 0.0, 8.0], dtype=data_type)
+    molecular_weight = cp.asarray([0.028, 0.032, 0.044, 0.018, 0.044, 0.016], dtype=data_type)
 
-u = cp.zeros((n_species, nr, nz), dtype=DTYPE)
-u += initial_vals[:, None, None]
-
-# Temperature field
-T_field = cp.full((nr, nz), DTYPE(inlet_reference_temperature), dtype=DTYPE)
+species_concentration_field = cp.zeros(
+    (
+     Species.count,
+     number_radial_cells,
+     number_axial_cells
+    ),
+    dtype=data_type
+)
+species_concentration_field += Species.initial_concentration[:, None, None]
+temperature_field = cp.full(
+    (
+     number_radial_cells,
+     number_axial_cells
+    ),
+    data_type(Gas.inlet_temperature),
+    dtype=data_type
+)
 
 # =========================
 # Precomputed energy constants
 # =========================
-cp_solid = DTYPE(900.0)
-rho_cp_eff = DTYPE(void_fraction * effective_gas_density * effective_gas_specific_heat_capacity
-                   + catalyst_weight * cp_solid)
+volumetric_heat_capacity = data_type(
+    Reactor.void_fraction * Gas.density * Gas.specific_heat_capacity 
+    + Catalyst.weight * Catalyst.specific_heat_capacity
+    )
 
 # =========================
 # Fused reaction (for end-of-run selectivity plots)
 # =========================
 @cp.fuse()
-def reaction_terms_T(concentration_ethylene, concentration_oxygen, T, KE1, KE2, n1, n2, k01, k02, Ea1, Ea2, ideal_gas_constant, catalyst_weight):
-    pA = cp.maximum(concentration_ethylene * ideal_gas_constant * T, DTYPE(0.0))
-    pB = cp.maximum(concentration_oxygen  * ideal_gas_constant * T, DTYPE(0.0))
-    pA_bar = pA / DTYPE(1e5); pB_bar = pB / DTYPE(1e5)
-    k1 = k01 * cp.exp(-Ea1 / (ideal_gas_constant * T))
-    k2 = k02 * cp.exp(-Ea2 / (ideal_gas_constant * T))
-    denom1 = cp.maximum(cp.square(DTYPE(1.0) + KE1 * pA_bar), DTYPE(1e-20))
-    denom2 = cp.maximum(cp.square(DTYPE(1.0) + KE2 * pA_bar), DTYPE(1e-20))
-    r1 = k1 * pA_bar * (pB_bar ** n1) * catalyst_weight / denom1
-    r2 = k2 * pA_bar * (pB_bar ** n2) * catalyst_weight / denom2
-    sA = -r1 - r2
-    sB = -DTYPE(0.5)*r1 - DTYPE(3.0)*r2
-    sC = r1
-    sD = DTYPE(2.0)*r2
-    sE = DTYPE(2.0)*r2
-    return sA, sB, sC, sD, sE, r1, r2
+def reaction_terms_T(
+    concentration_ethylene,
+    concentration_oxygen,
+    temperature,
+    KE1, KE2,
+    n1, n2,
+    k01, k02,
+    Ea1, Ea2,
+    ideal_gas_constant,
+    catalyst_weight
+):
+    ethylene_partial_pressure = cp.maximum(
+        (concentration_ethylene * ideal_gas_constant * temperature)/data_type(1e5),
+        data_type(0.0)
+    )
+
+    oxygen_partial_pressure = cp.maximum(
+        (concentration_oxygen  * ideal_gas_constant * temperature)/data_type(1e5),
+        data_type(0.0)
+    )
+
+    k1 = k01 * cp.exp(-Ea1 / (ideal_gas_constant * temperature))
+    k2 = k02 * cp.exp(-Ea2 / (ideal_gas_constant * temperature))
+
+    main_reaction_denominator = cp.maximum(
+        cp.square(data_type(1.0) + KE1 * ethylene_partial_pressure),
+        data_type(1e-20)
+    )
+
+    side_reaction_denominator = cp.maximum(
+        cp.square(data_type(1.0) + KE2 * ethylene_partial_pressure),
+        data_type(1e-20),
+    )
+
+    main_reaction_rate = (
+        k1 
+        * ethylene_partial_pressure 
+        * (oxygen_partial_pressure ** n1) 
+        * catalyst_weight 
+        / main_reaction_denominator
+    )
+
+    side_reaction_rate = (
+        k2
+        * ethylene_partial_pressure
+        * (oxygen_partial_pressure ** n2)
+        * catalyst_weight
+        / side_reaction_denominator
+    )
+
+    ethylene_source_term = - (main_reaction_rate + side_reaction_rate)
+    oxygen_source_term = -(data_type(0.5)*main_reaction_rate + data_type(3.0)*side_reaction_rate)
+    ethylene_oxide_source_term = main_reaction_rate
+    water_source_term = data_type(2.0)*side_reaction_rate
+    carbon_dioxide_source_term = data_type(2.0)*side_reaction_rate
+
+    return ethylene_source_term, oxygen_source_term, ethylene_oxide_source_term, water_source_term, carbon_dioxide_source_term, main_reaction_rate, side_reaction_rate
 
 # =========================
 # Ergun function
 # =========================
-def ergun_velocity_profile_vectorized(u_field, pressure_inlet, void_fraction, catalyst_particle_diameter,
-                                      mu, T_for_rho, ideal_gas_constant, molecular_weight,
-                                      dirichlet_inlet, dz, U_in, iters=1, p_floor=DTYPE(0.5e5)):
-    nsp, nr_, nz_ = u_field.shape
-    # cross-section avg composition vs z
-    c_avg = cp.mean(u_field, axis=1, dtype=DTYPE)        # (nsp, nz)
-    c_tot = cp.sum(c_avg, axis=0, dtype=DTYPE) + DTYPE(1e-30)
-    y     = c_avg / c_tot[None, :]
-    MW_mix = cp.sum(y * molecular_weight[:, None], axis=0, dtype=DTYPE)
+def ergun_pressure_velocity_profile(
+        species_concentration_field,
+        inlet_pressure,
+        bed_void_fraction,
+        catalyst_particle_diameter,
+        dynamic_viscosity_profile,
+        temperature_profile_density,
+        ideal_gas_constant,
+        species_molecular_weight,
+        inlet_concentrations,
+        axial_cell_size,
+        inlet_velocity,
+        iterations=1,
+        minimum_pressure=data_type(0.5e5)
+):
+    number_of_species, number_radial_cells, number_axial_cells = species_concentration_field.shape
+
+    cross_section_average_concentration_profile = cp.mean(
+        species_concentration_field,
+        axis=1,
+        dtype=data_type
+    )
+
+    total_concentration_profile = (
+        cp.sum(cross_section_average_concentration_profile, axis=0, dtype=data_type)
+        + data_type(1e-30)
+    )
+
+    mole_fraction_profile = (
+        cross_section_average_concentration_profile
+        / total_concentration_profile[None, :]
+    )
+
+    mixture_molecular_weight_profile = cp.sum(
+        mole_fraction_profile * species_molecular_weight[:, None],
+        axis=0,
+        dtype=data_type
+    )
+
     # inlet mixture props
-    c_in = dirichlet_inlet
-    y_in = c_in / (cp.sum(c_in, dtype=DTYPE) + DTYPE(1e-30))
-    MW_in = cp.sum(y_in * molecular_weight, dtype=DTYPE)
-    T_in = T_for_rho[0] if hasattr(T_for_rho, "ndim") and T_for_rho.ndim == 1 else T_for_rho
-    rho_in = (pressure_inlet * MW_in) / (ideal_gas_constant * T_in)
-    # mass flux G fixed by inlet superficial velocity
-    G = rho_in * U_in
+    inlet_mole_fractions = (
+        inlet_concentrations
+        / (cp.sum(inlet_concentrations, dtype=data_type) + data_type(1e-30))
+    )
+
+    inlet_mixture_molecular_weight = cp.sum(
+        inlet_mole_fractions * species_molecular_weight,
+        dtype=data_type
+    )
+
+    inlet_temperature_density = (
+        temperature_profile_density[0] 
+        if hasattr(temperature_profile_density, "ndim") and temperature_profile_density.ndim == 1
+        else temperature_profile_density
+    )
+
+    inlet_gas_density = (
+        (inlet_pressure * inlet_mixture_molecular_weight)
+        / (ideal_gas_constant * inlet_temperature_density)
+    )
+
+    # mass flux G fixed by inlet velocity
+    inlet_mass_flux = inlet_gas_density * inlet_velocity
+
     # Ergun coefficients
-    A1 = DTYPE(150.0) * (DTYPE(1.0) - void_fraction)**2 * mu / (void_fraction**3 * catalyst_particle_diameter**2)
-    A2 = DTYPE(1.75)  * (DTYPE(1.0) - void_fraction)     / (void_fraction**3 * catalyst_particle_diameter)
+    viscous_ergun_coefficient = (
+        data_type(150.0)
+        * (data_type(1.0) - bed_void_fraction) ** 2
+        * dynamic_viscosity_profile
+        / (bed_void_fraction**3 * catalyst_particle_diameter**2)
+    )
+    inertial_ergun_coefficient = (
+        data_type(1.75)
+        * (data_type(1.0) - bed_void_fraction)
+        / (bed_void_fraction**3 * catalyst_particle_diameter)
+    )
+
     # initial guess
-    rho = (pressure_inlet * MW_mix) / (ideal_gas_constant * T_for_rho)
-    rho = cp.maximum(rho, DTYPE(1e-6))
-    U   = G / rho
+    gas_density_profile = cp.maximum(
+        (inlet_pressure * mixture_molecular_weight_profile) 
+        / (ideal_gas_constant * temperature_profile_density),
+        data_type(1e-20)
+    )
+
+    superficial_velocity_profile = (
+        inlet_mass_flux / gas_density_profile
+    )
+
     # simple Picard
-    for _ in range(iters):
-        dpdz = A1 * U + A2 * rho * U * U
-        cum = cp.empty_like(dpdz)
-        if nz_ > 0: cum[0] = DTYPE(0.5) * dpdz[0] * dz
-        if nz_ > 1:
-            mid = DTYPE(0.5) * (dpdz[1:] + dpdz[:-1]) * dz
-            cum[1:] = cum[0] + cp.cumsum(mid, dtype=DTYPE)
-        p_z = cp.maximum(pressure_inlet - cum, p_floor)
-        rho_new = (p_z * MW_mix) / (ideal_gas_constant * T_for_rho)
-        rho_new = cp.maximum(rho_new, DTYPE(1e-6))
-        rho = DTYPE(0.6)*rho + DTYPE(0.4)*rho_new
-        U   = G / rho
-    return p_z, U
+    for _ in range(iterations):
+        # dpdz
+        axial_pressure_gradient_profile = (
+            viscous_ergun_coefficient * superficial_velocity_profile
+            + inertial_ergun_coefficient * gas_density_profile * cp.square(superficial_velocity_profile)
+        )
+
+        cumulative_pressure_drop_profile = cp.empty_like(axial_pressure_gradient_profile)
+
+        if number_axial_cells > 0:
+            cumulative_pressure_drop_profile[0] = (
+                data_type(0.5) * axial_pressure_gradient_profile[0] * axial_cell_size
+            )
+
+        if number_axial_cells > 1:
+            trapezoid_midpoint = (
+                data_type(0.5)
+                * (axial_pressure_gradient_profile[1:] + axial_pressure_gradient_profile[:-1])
+                * axial_cell_size
+            )
+            cumulative_pressure_drop_profile[1:] = (
+                cumulative_pressure_drop_profile[0]
+                + cp.cumsum(trapezoid_midpoint, dtype=data_type)
+            )
+
+        pressure_profile = cp.maximum(
+            inlet_pressure - cumulative_pressure_drop_profile,
+            minimum_pressure
+        )
+        
+        updated_gas_density_profile = cp.maximum(
+            (pressure_profile * mixture_molecular_weight_profile)
+            / (ideal_gas_constant * temperature_profile_density),
+            data_type(1e-20)
+        )
+
+        # Damping step to prevent oscillations
+        relaxation_factor = data_type(0.4)
+        gas_density_profile = (
+            (data_type(1.0) - relaxation_factor) * gas_density_profile
+            + relaxation_factor * updated_gas_density_profile
+        )
+
+        superficial_velocity_profile = inlet_mass_flux / gas_density_profile
+
+    return pressure_profile, superficial_velocity_profile
 
 # =========================
-# Macro-step fused kernel (ADR + reactions + energy) with SUB_STEPS subcycling
+# Macro-step fused kernel in CUDA C++ kernel code
 # =========================
-macro_step_src = f'''
+macro_step_source_code = f'''
 extern "C" __global__
 void macro_step(
-    const int nsp, const int nr, const int nz, const int substeps,
-    const {CUDTYPE}* __restrict__ u_in,   {CUDTYPE}* __restrict__ u_out,
-    const {CUDTYPE}* __restrict__ T_in,   {CUDTYPE}* __restrict__ T_out,
-    const {CUDTYPE}* __restrict__ invr,   // (nr-2)
-    const {CUDTYPE}* __restrict__ UL,     // (nz-2)
-    const {CUDTYPE}* __restrict__ UR,     // (nz-2)
-    const {CUDTYPE}* __restrict__ pc,     // (nz-2)
-    const {CUDTYPE} dr, const {CUDTYPE} dz, const {CUDTYPE} dt_sub,
-    const {CUDTYPE} a_dr2, const {CUDTYPE} half_a_dr, const {CUDTYPE} a_dz2, const {CUDTYPE} dt_over_dz,
-    const {CUDTYPE} beta_dt,
-    const {CUDTYPE} D_REF, const {CUDTYPE} T_ref, const {CUDTYPE} p_ref,
-    const {CUDTYPE} KE1, const {CUDTYPE} KE2, const {CUDTYPE} n1, const {CUDTYPE} n2,
-    const {CUDTYPE} k01, const {CUDTYPE} k02, const {CUDTYPE} Ea1, const {CUDTYPE} Ea2,
-    const {CUDTYPE} Rgas, const {CUDTYPE} cat_wt,
-    const {CUDTYPE} dH1, const {CUDTYPE} dH2,
-    const {CUDTYPE} rho_cp_eff, const {CUDTYPE} T_cool
+    const int number_of_species,
+    const int number_of_radial_cells,
+    const int number_of_axial_cells,
+    const int number_of_substeps,
+
+    const {cuda_data_type}* __restrict__ species_concentration_input,
+          {cuda_data_type}* __restrict__ species_concentration_output,
+
+    const {cuda_data_type}* __restrict__ temperature_input,
+          {cuda_data_type}* __restrict__ temperature_output,
+
+    const {cuda_data_type}* __restrict__ inverse_interior_radial_cell_center_positions,
+    const {cuda_data_type}* __restrict__ left_face_velocity,
+    const {cuda_data_type}* __restrict__ right_face_velocity,
+    const {cuda_data_type}* __restrict__ interior_cell_center_pressure,
+
+    const {cuda_data_type} radial_cell_size,
+    const {cuda_data_type} axial_cell_size,
+    const {cuda_data_type} substep_time_step,
+
+    const {cuda_data_type} thermal_diffusivity_time_over_radial_cell_size_squared,
+    const {cuda_data_type} half_thermal_diffusivity_time_over_radial_cell_size,
+    const {cuda_data_type} thermal_diffusivity_time_over_axial_cell_size_squared,
+    const {cuda_data_type} substep_time_over_axial_cell_size,
+
+    const {cuda_data_type} heat_transfer_sink_coefficient_time,
+
+    const {cuda_data_type} reference_mass_diffusivity,
+    const {cuda_data_type} reference_temperature,
+    const {cuda_data_type} reference_pressure,
+
+    const {cuda_data_type} adsorption_equilibrium_constant_main_reaction,
+    const {cuda_data_type} adsorption_equilibrium_constant_side_reaction,
+    const {cuda_data_type} oxygen_reaction_order_main_reaction,
+    const {cuda_data_type} oxygen_reaction_order_side_reaction,
+    const {cuda_data_type} pre_exponential_factor_main_reaction,
+    const {cuda_data_type} pre_exponential_factor_side_reaction,
+    const {cuda_data_type} activation_energy_main_reaction,
+    const {cuda_data_type} activation_energy_side_reaction,
+
+    const {cuda_data_type} ideal_gas_constant,
+    const {cuda_data_type} catalyst_mass_per_volume,
+
+    const {cuda_data_type} reaction_enthalpy_main_reaction,
+    const {cuda_data_type} reaction_enthalpy_side_reaction,
+
+    const {cuda_data_type} volumetric_heat_capacity,
+    const {cuda_data_type} coolant_temperature
 )
 {{
-    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;  // interior j: 1..nz-2
-    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;  // interior i: 1..nr-2
-    if (i >= nr-1 || j >= nz-1) return;
+    // Interior cell indices (skip boundary cells)
+    const int axial_cell_index  = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    const int radial_cell_index = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
-    const int W = nz;
-    const int H = nr;
-    const int stride_r = W;
-    const int stride_s = H * W;
+    if (radial_cell_index >= number_of_radial_cells - 1 || axial_cell_index >= number_of_axial_cells - 1) return;
 
-    const int j_in = j - 1;      // 0..nz-3
-    const int i_in = i - 1;      // 0..nr-3
+    const int axial_stride_for_row_major = number_of_axial_cells;
+    const int species_stride_for_row_major = number_of_radial_cells * number_of_axial_cells;
 
-    const {CUDTYPE} invr_i = invr[i_in];
-    const {CUDTYPE} UL_j   = UL[j_in];
-    const {CUDTYPE} UR_j   = UR[j_in];
-    const {CUDTYPE} pcent  = pc[j_in];
+    const int interior_axial_index  = axial_cell_index - 1;   // 0 .. number_of_axial_cells-3
+    const int interior_radial_index = radial_cell_index - 1;  // 0 .. number_of_radial_cells-3
 
-    const {CUDTYPE} zero = ({CUDTYPE})0.0;
-    const {CUDTYPE} half = ({CUDTYPE})0.5;
-    const {CUDTYPE} two  = ({CUDTYPE})2.0;
-    const {CUDTYPE} tiny = ({CUDTYPE})1e-30;
+    const {cuda_data_type} inverse_radial_position =
+        inverse_interior_radial_cell_center_positions[interior_radial_index];
 
-    const {CUDTYPE} *u_read = u_in;
-          {CUDTYPE} *u_write= u_out;
-    const {CUDTYPE} *T_read = T_in;
-          {CUDTYPE} *T_write= T_out;
+    const {cuda_data_type} left_face_velocity_value  = left_face_velocity[interior_axial_index];
+    const {cuda_data_type} right_face_velocity_value = right_face_velocity[interior_axial_index];
+    const {cuda_data_type} cell_center_pressure_value = interior_cell_center_pressure[interior_axial_index];
 
-    for (int sstep = 0; sstep < substeps; ++sstep) {{
+    const {cuda_data_type} zero_value = ({cuda_data_type})0.0;
+    const {cuda_data_type} half_value = ({cuda_data_type})0.5;
+    const {cuda_data_type} two_value  = ({cuda_data_type})2.0;
+    const {cuda_data_type} tiny_value = ({cuda_data_type})1e-30;
 
-        // 1) ADR step for all species
-        for (int sp = 0; sp < nsp; ++sp) {{
-            int base    = sp*stride_s + i*stride_r + j;
-            int base_rp = sp*stride_s + (i+1)*stride_r + j;
-            int base_rm = sp*stride_s + (i-1)*stride_r + j;
-            int base_zp = sp*stride_s + i*stride_r + (j+1);
-            int base_zm = sp*stride_s + i*stride_r + (j-1);
+    const {cuda_data_type} pressure_scaling_factor = ({cuda_data_type})1e-5;
 
-            {CUDTYPE} uc  = u_read[base];
-            {CUDTYPE} urp = u_read[base_rp];
-            {CUDTYPE} urm = u_read[base_rm];
-            {CUDTYPE} uzp = u_read[base_zp];
-            {CUDTYPE} uzm = u_read[base_zm];
+    const {cuda_data_type}* species_concentration_read = species_concentration_input;
+          {cuda_data_type}* species_concentration_write = species_concentration_output;
 
-            // Local D(T,p)
-            {CUDTYPE} Tc   = T_read[i*stride_r + j];
-            {CUDTYPE} Dloc = D_REF * pow(Tc / T_ref, ({CUDTYPE})1.75) * (p_ref / (pcent + tiny));
+    const {cuda_data_type}* temperature_read = temperature_input;
+          {cuda_data_type}* temperature_write = temperature_output;
 
-            {CUDTYPE} lap_r = (urp - two*uc + urm) / (dr*dr)
-                            + (urp - urm) * (half/dr) * invr_i;
-            {CUDTYPE} lap_z = (uzp - two*uc + uzm) / (dz*dz);
-            {CUDTYPE} diff  = dt_sub * Dloc * (lap_r + lap_z);
+    for (int substep_index = 0; substep_index < number_of_substeps; ++substep_index) {{
 
-            // upwind advection in z
-            int base_jm = sp*stride_s + i*stride_r + (j-1);
-            int base_jp = sp*stride_s + i*stride_r + (j+1);
-            {CUDTYPE} cjm = u_read[base_jm];
-            {CUDTYPE} cj  = uc;
-            {CUDTYPE} cjp = u_read[base_jp];
-            {CUDTYPE} FL  = (UL_j > zero) ? UL_j * cjm : UL_j * cj;
-            {CUDTYPE} FR  = (UR_j > zero) ? UR_j * cj  : UR_j * cjp;
-            {CUDTYPE} adv = - dt_over_dz * (FR - FL);
+        // ------------------------------------------------------------
+        // 1) Advection + diffusion update for all species concentrations
+        // ------------------------------------------------------------
+        const int temperature_center_index =
+            radial_cell_index * axial_stride_for_row_major + axial_cell_index;
 
-            u_write[base] = uc + diff + adv;
+        const {cuda_data_type} temperature_center_for_transport =
+            temperature_read[temperature_center_index];
+
+        const {cuda_data_type} local_mass_diffusivity =
+            reference_mass_diffusivity
+            * pow(temperature_center_for_transport / reference_temperature, ({cuda_data_type})1.75)
+            * (reference_pressure / (cell_center_pressure_value + tiny_value));
+
+        for (int species_index = 0; species_index < number_of_species; ++species_index) {{
+
+            const int center_index =
+                species_index * species_stride_for_row_major
+                + radial_cell_index * axial_stride_for_row_major
+                + axial_cell_index;
+
+            const int radial_plus_index =
+                species_index * species_stride_for_row_major
+                + (radial_cell_index + 1) * axial_stride_for_row_major
+                + axial_cell_index;
+
+            const int radial_minus_index =
+                species_index * species_stride_for_row_major
+                + (radial_cell_index - 1) * axial_stride_for_row_major
+                + axial_cell_index;
+
+            const int axial_plus_index =
+                species_index * species_stride_for_row_major
+                + radial_cell_index * axial_stride_for_row_major
+                + (axial_cell_index + 1);
+
+            const int axial_minus_index =
+                species_index * species_stride_for_row_major
+                + radial_cell_index * axial_stride_for_row_major
+                + (axial_cell_index - 1);
+
+            const {cuda_data_type} concentration_center = species_concentration_read[center_index];
+            const {cuda_data_type} concentration_radial_plus = species_concentration_read[radial_plus_index];
+            const {cuda_data_type} concentration_radial_minus = species_concentration_read[radial_minus_index];
+            const {cuda_data_type} concentration_axial_plus = species_concentration_read[axial_plus_index];
+            const {cuda_data_type} concentration_axial_minus = species_concentration_read[axial_minus_index];
+
+            const {cuda_data_type} radial_laplacian =
+                (concentration_radial_plus - two_value * concentration_center + concentration_radial_minus)
+                / (radial_cell_size * radial_cell_size)
+                + (concentration_radial_plus - concentration_radial_minus)
+                * (half_value / radial_cell_size)
+                * inverse_radial_position;
+
+            const {cuda_data_type} axial_laplacian =
+                (concentration_axial_plus - two_value * concentration_center + concentration_axial_minus)
+                / (axial_cell_size * axial_cell_size);
+
+            const {cuda_data_type} diffusion_increment =
+                substep_time_step * local_mass_diffusivity * (radial_laplacian + axial_laplacian);
+
+            const {cuda_data_type} left_face_flux =
+                (left_face_velocity_value > zero_value)
+                    ? left_face_velocity_value * concentration_axial_minus
+                    : left_face_velocity_value * concentration_center;
+
+            const {cuda_data_type} right_face_flux =
+                (right_face_velocity_value > zero_value)
+                    ? right_face_velocity_value * concentration_center
+                    : right_face_velocity_value * concentration_axial_plus;
+
+            const {cuda_data_type} advection_increment =
+                -substep_time_over_axial_cell_size * (right_face_flux - left_face_flux);
+
+            species_concentration_write[center_index] =
+                concentration_center + diffusion_increment + advection_increment;
         }}
 
-        // 2) Reactions on advected fields
-        int baseA = 0*stride_s + i*stride_r + j;
-        int baseB = 1*stride_s + i*stride_r + j;
-        {CUDTYPE} cA = u_write[baseA];
-        {CUDTYPE} cB = u_write[baseB];
+        // ------------------------------------------------------------
+        // 2) Reaction source terms and heat release
+        //    (assumes species order: 0 Ethylene, 1 Oxygen, 2 Ethylene Oxide, 3 Water, 4 Carbon Dioxide)
+        // ------------------------------------------------------------
+        const int ethylene_species_index = 0;
+        const int oxygen_species_index = 1;
 
-        // temperature indices
-        int Tidx   = i*stride_r + j;
-        int Tidx_rp= (i+1)*stride_r + j;
-        int Tidx_rm= (i-1)*stride_r + j;
-        int Tidx_zp= i*stride_r + (j+1);
-        int Tidx_zm= i*stride_r + (j-1);
+        const int ethylene_center_index =
+            ethylene_species_index * species_stride_for_row_major
+            + radial_cell_index * axial_stride_for_row_major
+            + axial_cell_index;
 
-        {CUDTYPE} Tc = T_read[Tidx];
+        const int oxygen_center_index =
+            oxygen_species_index * species_stride_for_row_major
+            + radial_cell_index * axial_stride_for_row_major
+            + axial_cell_index;
 
-        {CUDTYPE} q_term = zero;
-        if (cA > tiny && cB > tiny) {{
-            {CUDTYPE} pA = cA * Rgas * Tc;
-            {CUDTYPE} pB = cB * Rgas * Tc;
-            {CUDTYPE} pAb= pA * ({CUDTYPE})1e-5;
-            {CUDTYPE} pBb= pB * ({CUDTYPE})1e-5;
+        {cuda_data_type} ethylene_concentration = species_concentration_write[ethylene_center_index];
+        {cuda_data_type} oxygen_concentration   = species_concentration_write[oxygen_center_index];
 
-            {CUDTYPE} k1 = k01 * exp(-Ea1 / (Rgas * Tc));
-            {CUDTYPE} k2 = k02 * exp(-Ea2 / (Rgas * Tc));
-            {CUDTYPE} d1 = ({CUDTYPE})1.0 + KE1 * pAb; d1 *= d1;
-            {CUDTYPE} d2 = ({CUDTYPE})1.0 + KE2 * pAb; d2 *= d2;
+        const {cuda_data_type} temperature_center_for_reactions =
+            temperature_read[temperature_center_index];
 
-            {CUDTYPE} r1 = k1 * pAb * pow(pBb, n1) * cat_wt / d1;
-            {CUDTYPE} r2 = k2 * pAb * pow(pBb, n2) * cat_wt / d2;
+        {cuda_data_type} reaction_temperature_increment = zero_value;
 
-            u_write[baseA] += dt_sub * ( -r1 - r2 );
-            u_write[baseB] += dt_sub * ( -({CUDTYPE})0.5 * r1 - ({CUDTYPE})3.0 * r2 );
-            u_write[2*stride_s + i*stride_r + j] += dt_sub * ( r1 );
-            u_write[3*stride_s + i*stride_r + j] += dt_sub * ( ({CUDTYPE})2.0 * r2 );
-            u_write[4*stride_s + i*stride_r + j] += dt_sub * ( ({CUDTYPE})2.0 * r2 );
+        if (ethylene_concentration > tiny_value && oxygen_concentration > tiny_value) {{
 
-            {CUDTYPE} q_rxn = - (dH1 * r1 + dH2 * r2);
-            q_term = dt_sub * (q_rxn / rho_cp_eff);
+            const {cuda_data_type} ethylene_partial_pressure_scaled =
+                (ethylene_concentration * ideal_gas_constant * temperature_center_for_reactions) * pressure_scaling_factor;
+
+            const {cuda_data_type} oxygen_partial_pressure_scaled =
+                (oxygen_concentration * ideal_gas_constant * temperature_center_for_reactions) * pressure_scaling_factor;
+
+            const {cuda_data_type} main_reaction_rate_constant =
+                pre_exponential_factor_main_reaction
+                * exp(-activation_energy_main_reaction / (ideal_gas_constant * temperature_center_for_reactions));
+
+            const {cuda_data_type} side_reaction_rate_constant =
+                pre_exponential_factor_side_reaction
+                * exp(-activation_energy_side_reaction / (ideal_gas_constant * temperature_center_for_reactions));
+
+            {cuda_data_type} main_reaction_denominator =
+                ({cuda_data_type})1.0 + adsorption_equilibrium_constant_main_reaction * ethylene_partial_pressure_scaled;
+            main_reaction_denominator *= main_reaction_denominator;
+
+            {cuda_data_type} side_reaction_denominator =
+                ({cuda_data_type})1.0 + adsorption_equilibrium_constant_side_reaction * ethylene_partial_pressure_scaled;
+            side_reaction_denominator *= side_reaction_denominator;
+
+            const {cuda_data_type} main_reaction_rate =
+                main_reaction_rate_constant
+                * ethylene_partial_pressure_scaled
+                * pow(oxygen_partial_pressure_scaled, oxygen_reaction_order_main_reaction)
+                * catalyst_mass_per_volume
+                / main_reaction_denominator;
+
+            const {cuda_data_type} side_reaction_rate =
+                side_reaction_rate_constant
+                * ethylene_partial_pressure_scaled
+                * pow(oxygen_partial_pressure_scaled, oxygen_reaction_order_side_reaction)
+                * catalyst_mass_per_volume
+                / side_reaction_denominator;
+
+            // Species concentration updates
+            species_concentration_write[ethylene_center_index] +=
+                substep_time_step * ( -main_reaction_rate - side_reaction_rate );
+
+            species_concentration_write[oxygen_center_index] +=
+                substep_time_step * ( -({cuda_data_type})0.5 * main_reaction_rate - ({cuda_data_type})3.0 * side_reaction_rate );
+
+            species_concentration_write[2 * species_stride_for_row_major + radial_cell_index * axial_stride_for_row_major + axial_cell_index] +=
+                substep_time_step * ( main_reaction_rate );
+
+            species_concentration_write[3 * species_stride_for_row_major + radial_cell_index * axial_stride_for_row_major + axial_cell_index] +=
+                substep_time_step * ( ({cuda_data_type})2.0 * side_reaction_rate );
+
+            species_concentration_write[4 * species_stride_for_row_major + radial_cell_index * axial_stride_for_row_major + axial_cell_index] +=
+                substep_time_step * ( ({cuda_data_type})2.0 * side_reaction_rate );
+
+            const {cuda_data_type} volumetric_heat_release =
+                - (reaction_enthalpy_main_reaction * main_reaction_rate + reaction_enthalpy_side_reaction * side_reaction_rate);
+
+            reaction_temperature_increment =
+                substep_time_step * (volumetric_heat_release / volumetric_heat_capacity);
         }}
 
-        // 3) Temperature (conduction + advection + semi-implicit sink + reaction)
-        {CUDTYPE} Trp = T_read[Tidx_rp];
-        {CUDTYPE} Trm = T_read[Tidx_rm];
-        {CUDTYPE} Tzp = T_read[Tidx_zp];
-        {CUDTYPE} Tzm = T_read[Tidx_zm];
+        // ------------------------------------------------------------
+        // 3) Temperature update (conduction + advection + sink + reaction)
+        // ------------------------------------------------------------
+        const int temperature_radial_plus_index =
+            (radial_cell_index + 1) * axial_stride_for_row_major + axial_cell_index;
 
-        {CUDTYPE} radial = (Trp - two*Tc + Trm) * a_dr2
-                         + (Trp - Trm) * half_a_dr * invr_i;
-        {CUDTYPE} axial  = (Tzp - two*Tc + Tzm) * a_dz2;
+        const int temperature_radial_minus_index =
+            (radial_cell_index - 1) * axial_stride_for_row_major + axial_cell_index;
 
-        {CUDTYPE} FLT = (UL_j > zero) ? UL_j * T_read[Tidx_zm] : UL_j * Tc;
-        {CUDTYPE} FRT = (UR_j > zero) ? UR_j * Tc              : UR_j * T_read[Tidx_zp];
-        {CUDTYPE} advT= - dt_over_dz * (FRT - FLT);
+        const int temperature_axial_plus_index =
+            radial_cell_index * axial_stride_for_row_major + (axial_cell_index + 1);
 
-        {CUDTYPE} Tstar = Tc + radial + axial + advT + q_term;
-        T_write[Tidx] = (Tstar + beta_dt * T_cool) / ( ({CUDTYPE})1.0 + beta_dt );
+        const int temperature_axial_minus_index =
+            radial_cell_index * axial_stride_for_row_major + (axial_cell_index - 1);
 
-        // 4) Clamp non-negative species
-        for (int sp = 0; sp < nsp; ++sp) {{
-            int b = sp*stride_s + i*stride_r + j;
-            {CUDTYPE} val = u_write[b];
-            if (val < zero) u_write[b] = zero;
+        const {cuda_data_type} temperature_center = temperature_read[temperature_center_index];
+        const {cuda_data_type} temperature_radial_plus = temperature_read[temperature_radial_plus_index];
+        const {cuda_data_type} temperature_radial_minus = temperature_read[temperature_radial_minus_index];
+        const {cuda_data_type} temperature_axial_plus = temperature_read[temperature_axial_plus_index];
+        const {cuda_data_type} temperature_axial_minus = temperature_read[temperature_axial_minus_index];
+
+        const {cuda_data_type} radial_conduction_increment =
+            (temperature_radial_plus - two_value * temperature_center + temperature_radial_minus)
+            * thermal_diffusivity_time_over_radial_cell_size_squared
+            + (temperature_radial_plus - temperature_radial_minus)
+            * half_thermal_diffusivity_time_over_radial_cell_size
+            * inverse_radial_position;
+
+        const {cuda_data_type} axial_conduction_increment =
+            (temperature_axial_plus - two_value * temperature_center + temperature_axial_minus)
+            * thermal_diffusivity_time_over_axial_cell_size_squared;
+
+        const {cuda_data_type} left_face_temperature_flux =
+            (left_face_velocity_value > zero_value)
+                ? left_face_velocity_value * temperature_axial_minus
+                : left_face_velocity_value * temperature_center;
+
+        const {cuda_data_type} right_face_temperature_flux =
+            (right_face_velocity_value > zero_value)
+                ? right_face_velocity_value * temperature_center
+                : right_face_velocity_value * temperature_axial_plus;
+
+        const {cuda_data_type} temperature_advection_increment =
+            -substep_time_over_axial_cell_size * (right_face_temperature_flux - left_face_temperature_flux);
+
+        const {cuda_data_type} temperature_intermediate =
+            temperature_center
+            + radial_conduction_increment
+            + axial_conduction_increment
+            + temperature_advection_increment
+            + reaction_temperature_increment;
+
+        temperature_write[temperature_center_index] =
+            (temperature_intermediate + heat_transfer_sink_coefficient_time * coolant_temperature)
+            / (({cuda_data_type})1.0 + heat_transfer_sink_coefficient_time);
+
+        // ------------------------------------------------------------
+        // 4) Clamp species concentrations to non-negative values
+        // ------------------------------------------------------------
+        for (int species_index = 0; species_index < number_of_species; ++species_index) {{
+            const int center_index =
+                species_index * species_stride_for_row_major
+                + radial_cell_index * axial_stride_for_row_major
+                + axial_cell_index;
+
+            const {cuda_data_type} concentration_value = species_concentration_write[center_index];
+            if (concentration_value < zero_value) species_concentration_write[center_index] = zero_value;
         }}
 
-        // ping-pong
-        const {CUDTYPE}* tmpU = u_read;  u_read  = u_write;  u_write  = ({CUDTYPE}*)tmpU;
-        const {CUDTYPE}* tmpT = T_read;  T_read  = T_write;  T_write  = ({CUDTYPE}*)tmpT;
+        // ------------------------------------------------------------
+        // Ping-pong buffers
+        // ------------------------------------------------------------
+        const {cuda_data_type}* temporary_species_pointer = species_concentration_read;
+        species_concentration_read = species_concentration_write;
+        species_concentration_write = ({cuda_data_type}*)temporary_species_pointer;
+
+        const {cuda_data_type}* temporary_temperature_pointer = temperature_read;
+        temperature_read = temperature_write;
+        temperature_write = ({cuda_data_type}*)temporary_temperature_pointer;
     }}
 }}
 '''
-macro_step = cp.RawKernel(macro_step_src, 'macro_step', options=('--use_fast_math',))
+
+macro_step = cp.RawKernel(macro_step_source_code, "macro_step", options=("--use_fast_math",))
 
 # =========================
 # Macro-step loop setup
@@ -368,205 +737,405 @@ SUB_STEPS   = 1
 CHUNK_STEPS = 1          
 assert SUB_STEPS % CHUNK_STEPS == 0
 
-n_macro = number_of_steps // SUB_STEPS
-rem     = number_of_steps %  SUB_STEPS
-if rem:
+number_of_macro_steps = number_of_time_steps // SUB_STEPS
+remaining_time_steps     = number_of_time_steps %  SUB_STEPS
+if remaining_time_steps:
     raise ValueError("number_of_steps must be divisible by SUB_STEPS")
 
-# substep dt and *substep-scaled* coefficients (CRITICAL)
-dt_sub                      = DTYPE(dt / SUB_STEPS)
-alpha_dt_over_dr2_sub       = DTYPE(alpha * dt_sub / (dr*dr))
-alpha_dt_over_dz2_sub       = DTYPE(alpha * dt_sub / (dz*dz))
-half_alpha_dt_over_dr_sub   = DTYPE(0.5) * DTYPE(alpha * dt_sub / dr)
-dt_over_dz_sub              = DTYPE(dt_sub / dz)
-beta_dt_sub                 = DTYPE((volumetric_heat_transfer_coefficient / rho_cp_eff) * dt_sub)
+substep_time_step = data_type(time_step_size / SUB_STEPS)
+
+thermal_diffusivity_time_over_radial_cell_size_squared = data_type(
+    Gas.thermal_diffusivity * substep_time_step
+    / (radial_cell_size*radial_cell_size)
+)
+
+thermal_diffusivity_time_over_axial_cell_size_squared = data_type(
+    Gas.thermal_diffusivity * substep_time_step
+    / (axial_cell_size*axial_cell_size)
+)
+
+half_thermal_diffusivity_time_over_radial_cell_size = (
+    data_type(0.5)
+    * data_type(Gas.thermal_diffusivity * substep_time_step / radial_cell_size)
+)
+
+substep_time_over_axial_cell_size = data_type(substep_time_step / axial_cell_size)
+
+heat_transfer_sink_coefficient_time = data_type(
+    (Reactor.heat_transfer_coefficient / volumetric_heat_capacity)
+    * substep_time_step
+)
 
 # ping-pong buffers
-u_buf  = cp.empty_like(u)
-T_buf  = cp.empty_like(T_field)
+species_concentration_buffer_field = cp.empty_like(species_concentration_field)
+
+temperature_buffer_field = cp.empty_like(temperature_field)
 
 # face arrays & 1/r flatten
-U_faces  = cp.empty((nz-1,), dtype=DTYPE)
-U_L_arr  = cp.empty((nz-2,), dtype=DTYPE)
-U_R_arr  = cp.empty((nz-2,), dtype=DTYPE)
-inv_r_line = cp.ascontiguousarray(inv_r_mid_T.ravel())  # (nr-2,)
+face_velocity_profile = cp.empty(
+    (number_axial_cells - 1),
+    dtype=data_type
+)
+
+left_face_velocity_profile = cp.empty(
+    (number_axial_cells - 2),
+    dtype=data_type
+)
+
+right_face_velocity_profile = cp.empty(
+    (number_axial_cells - 2),
+    dtype=data_type
+)
+
+inverse_interior_radial_cell_center_position_line_contiguous = cp.ascontiguousarray(
+    inverse_interior_radial_cell_center_position_line.ravel()
+)
 
 # initialize inlet BC
-u[:, :, 0] = dirichlet_inlet[:, None]
+species_concentration_field[:, :, 0] = Species.inlet_concentrations[:, None]
 
 # initial Ergun
-T_z_avg = cp.mean(T_field, axis=0, dtype=DTYPE)
-mu_z = DTYPE(mu_ref) * (T_z_avg / DTYPE(inlet_reference_temperature))**DTYPE(0.7)
-p_z, U_profile = ergun_velocity_profile_vectorized(
-    u, pressure_inlet, void_fraction, catalyst_particle_diameter,
-    mu_z, T_z_avg, ideal_gas_constant, molecular_weight, dirichlet_inlet, dz, U_in,
-    iters=1, p_floor=DTYPE(0.5e5)
+axial_average_temperature_profile = cp.mean(
+    temperature_field,
+    axis=0,
+    dtype=data_type
+)
+
+axial_dynamic_viscosity_profile = (
+    data_type(Gas.dynamic_viscosity)
+    * (axial_average_temperature_profile / data_type(Gas.inlet_temperature))
+    **data_type(0.7)
+)
+
+pressure_profile, superficial_velocity_profile = ergun_pressure_velocity_profile(
+    species_concentration_field,
+    Gas.inlet_pressure,
+    Reactor.void_fraction,
+    Catalyst.particle_diameter,
+    axial_dynamic_viscosity_profile,
+    axial_average_temperature_profile,
+    Gas.ideal_gas_constant,
+    Species.molecular_weight,
+    Species.inlet_concentrations,
+    axial_cell_size,
+    Gas.inlet_superficial_velocity,
+    iterations=1,
+    minimum_pressure=data_type(0.5e5)
 )
 
 # Kernel launch shape (interior region only)
-block = (32, 4, 1)
-grid  = ((nz-2 + block[0]-1)//block[0],
-         (nr-2 + block[1]-1)//block[1], 1)
+threads_per_block = (32, 4, 1)
+blocks_per_grid = (
+    (number_axial_cells-2 + threads_per_block[0] - 1) // threads_per_block[0],
+    (number_radial_cells-2 + threads_per_block[1] - 1) // threads_per_block[1],
+    1
+)
 
-# handy constants
-beta = volumetric_heat_transfer_coefficient / rho_cp_eff
+heat_transfer_sink_coefficient = Reactor.heat_transfer_coefficient / volumetric_heat_capacity
 
 # -------------------------
 # Macro-step main loop
 # -------------------------
-t0 = pytime.time()
+simulation_start_time = pytime.time()
 LOG_EVERY = max(1, n_macro // 1)
-RECOMP_TOL  = 1e-4  # recompute Ergun when Tz changes “enough”
-last_Tz = T_z_avg
+RECOMP_TOL  = 1e-4  # recompute Ergun when Tz changes
 
-# current / next (ping-pong) views
-u0, u1 = u, u_buf
-T0, T1 = T_field, T_buf
+previous_axial_average_temperature_profile = axial_average_temperature_profile
 
-for m in range(n_macro):
-    # Recompute Ergun each macro (or use your tolerance logic)
-    T_z_avg = cp.mean(T0, axis=0, dtype=DTYPE)
-    if cp.max(cp.abs((T_z_avg - last_Tz) / (T_z_avg + 1e-6))) > RECOMP_TOL:
-        mu_z = DTYPE(mu_ref) * (T_z_avg / DTYPE(inlet_reference_temperature))**DTYPE(0.7)
-        p_z, U_profile = ergun_velocity_profile_vectorized(
-            u0, pressure_inlet, void_fraction, catalyst_particle_diameter,
-            mu_z, T_z_avg, ideal_gas_constant, molecular_weight, dirichlet_inlet, dz, U_in,
-            iters=1, p_floor=DTYPE(0.5e5)
+current_species_concentration_field, next_species_concentration_field = (
+    species_concentration_field,
+    species_concentration_buffer_field
+)
+
+current_temperature_field, next_temperature_field = (
+    temperature_field,
+    temperature_buffer_field
+)
+
+for macro_step_index in range(number_of_macro_steps):
+
+    # Recompute Ergun each macro
+    axial_average_temperature_profile = cp.mean(
+        current_temperature_field,
+        axis=0,
+        dtype = data_type
+    )
+
+    relative_temperature_change = cp.max(
+        cp.abs(
+            (axial_average_temperature_profile - previous_axial_average_temperature_profile)
+            / (axial_average_temperature_profile + data_type(1e-6))
         )
-        last_Tz = T_z_avg
+    )
 
-    # build face velocities: U_faces = 0.5*(U[:-1]+U[1:])
-    cp.add(U_profile[:-1], U_profile[1:], out=U_faces)
-    U_faces *= DTYPE(0.5)
-    U_L_arr[...] = U_faces[:-1]
-    U_R_arr[...] = U_faces[ 1:]
-    p_center = p_z[1:-1]  # (nz-2,)
+    if relative_temperature_change > temperature_change_tolerance:
+        axial_dynamic_viscosity_profile = (
+            data_type(Gas.dynamic_viscosity)
+            * (axial_average_temperature_profile / data_type(Gas.inlet_temperature))
+            ** data_type(0.7)
+        )
 
-    remaining = SUB_STEPS
-    while remaining > 0:
-        s_this = min(CHUNK_STEPS, remaining)
+        pressure_profile, superficial_velocity_profile = ergun_pressure_velocity_profile(
+            current_species_concentration_field,
+            Gas.inlet_pressure,
+            Reactor.void_fraction,
+            Catalyst.particle_diameter,
+            axial_dynamic_viscosity_profile,
+            axial_average_temperature_profile,
+            Gas.ideal_gas_constant,
+            Species.molecular_weight,
+            Species.inlet_concentrations,
+            axial_cell_size,
+            Gas.inlet_superficial_velocity,
+            iterations=1,
+            minimum_pressure=data_type(0.5e5),
+        )
 
-        # Call macro_step with *substep* coefficients and dt_sub
+        previous_axial_average_temperature_profile = axial_average_temperature_profile
+
+    # build face velocities: from the centre velocity profile
+    cp.add(
+        superficial_velocity_profile[:-1],
+        superficial_velocity_profile[1:],
+        out=face_velocity_profile
+    )
+    face_velocity_profile *= data_type(0.5)
+
+    left_face_velocity_profile[...] = face_velocity_profile[:-1]
+    right_face_velocity_profile[...] = face_velocity_profile[ 1:]
+
+    interior_cell_center_pressure_profile = pressure_profile[1:-1]
+
+    remaining_substeps = SUB_STEPS
+    while remaining_substeps > 0:
+        number_of_substeps_this_call = min(CHUNK_STEPS, remaining)
+
         macro_step(
-            grid, block,
+            blocks_per_grid,
+            threads_per_block,
             (
-                # sizes / loop count
-                np.int32(n_species), np.int32(nr), np.int32(nz), np.int32(s_this),
+                np.int32(Species.count),
+                np.int32(number_radial_cells),
+                np.int32(number_axial_cells),
+                np.int32(number_of_substeps_this_call),
 
-                # ping-pong fields (read u0/T0, write u1/T1)
-                u0, u1, T0, T1,
+                current_species_concentration_field,
+                next_species_concentration_field,
+                current_temperature_field,
+                next_temperature_field,
 
-                # geometry helpers (1/r), faces, center pressure
-                inv_r_line, U_L_arr, U_R_arr, p_center,
+                inverse_interior_radial_cell_center_position_line_contiguous,
+                left_face_velocity_profile,
+                right_face_velocity_profile,
+                interior_cell_center_pressure_profile,
 
-                # spacing and time (substep)
-                dr, dz, dt_sub,
+                radial_cell_size,
+                axial_cell_size,
+                substep_time_step,
 
-                # *** substep-scaled transport coefficients ***
-                alpha_dt_over_dr2_sub, half_alpha_dt_over_dr_sub,
-                alpha_dt_over_dz2_sub, dt_over_dz_sub,
-                beta_dt_sub,
+                # substep-scaled transport coefficients
+                thermal_diffusivity_time_over_radial_cell_size_squared,
+                half_thermal_diffusivity_time_over_radial_cell_size,
+                thermal_diffusivity_time_over_axial_cell_size_squared,
+                substep_time_over_axial_cell_size,
+                heat_transfer_sink_coefficient_time,
 
                 # diffusion & kinetics constants
-                D_REF, inlet_reference_temperature, p_ref,
-                KE1, KE2, n1, n2, k01, k02, Ea1, Ea2,
-                ideal_gas_constant, catalyst_weight,
+                Catalyst.weight,
+                mass_diffusivity,
+                Gas.inlet_temperature,
+                Gas.inlet_pressure,
+                Gas.ideal_gas_constant,
 
+                Main_Reaction.KE1,
+                Main_Reaction.n1,
+                Main_Reaction.k01,
+                Main_Reaction.Ea1,
+                Main_Reaction.dH1,
+
+                Side_Reaction.KE2,
+                Side_Reaction.n2,
+                Side_Reaction.k02,
+                Side_Reaction.Ea2,
+                Side_Reaction.dH2,
                 # energy source and cooling pieces
-                dH1, dH2, rho_cp_eff, coolant_temperature
+                volumetric_heat_capacity,
+                coolant_temperature
             )
         )
 
         # swap for next substep
-        u0, u1 = u1, u0
-        T0, T1 = T1, T0
+        current_species_concentration_field, next_species_concentration_field = (
+            next_species_concentration_field,
+            current_species_concentration_field
+        )
 
-        # apply BCs each chunk (CHUNK_STEPS=1 ⇒ every substep)
-        u0[:, 0, :]  = u0[:, 1, :]
-        u0[:, -1, :] = u0[:, -2, :]
-        u0[:, :,  0] = dirichlet_inlet[:, None]
-        u0[:, :, -1] = u0[:, :, -2]
+        current_temperature_field, next_temperature_field = (
+            next_temperature_field,
+            current_temperature_field
+        )
 
-        T0[0, :]  = T0[1, :]
-        T0[-1, :] = T0[-2, :]
-        T0[:,  0] = DTYPE(inlet_reference_temperature)
-        T0[:, -1] = T0[:, -2]
+        # Apply BC at each chunk
+        current_species_concentration_field[:, 0, :]  = current_species_concentration_field[:, 1, :]
+        current_species_concentration_field[:, -1, :] = current_species_concentration_field[:, -2, :]
+        current_species_concentration_field[:, :,  0] = Species.initial_concentration[:, None]
+        current_species_concentration_field[:, :, -1] = current_species_concentration_field[:, :, -2]
 
-        remaining -= s_this
+        current_temperature_field[0, :]  = current_temperature_field[1, :]
+        current_temperature_field[-1, :] = current_temperature_field[-2, :]
+        current_temperature_field[:,  0] = data_type(Gas.inlet_temperature)
+        current_temperature_field[:, -1] = current_temperature_field[:, -2]
 
-    # (optional) logging per macro
-    if (m % LOG_EVERY) == 0:
-        p_out = float(p_z[-1])
-        T_out_mean = float(cp.mean(T0[:, -1]))
-        elapsed = pytime.time() - t0
-        frac = (m + 1) / n_macro
-        eta  = elapsed * (1 - frac) / max(frac, 1e-9)
-        print(f"Macro {m+1}/{n_macro} (sub={SUB_STEPS}) p_out={p_out/1e5:.3f} bar  "
-              f"T_out~{T_out_mean:.1f} K  elapsed={elapsed:.1f}s  ETA={eta:.1f}s")
+        remaining_substeps -= number_of_substeps_this_call
 
-# make sure the “current” arrays are the ones you plot later
-u       = u0
-T_field = T0
+    # Logging per macro
+    if (macro_step_index % LOG_EVERY) == 0:
+        outlet_pressure_value = float(pressure_profile[-1])
+        
+        outlet_average_temperature_value = float(
+            cp.mean(current_temperature_field[:, -1])
+        )
+        
+        elapsed_simulation_time = pytime.time() - current_temperature_field
+        
+        completed_fraction = (macro_step_index + 1) / number_of_macro_steps
+        
+        estimated_remaining_time = (
+            elapsed_simulation_time * (1 - completed_fraction)
+            / max(completed_fraction, 1e-9)
+        )
+        
+        print(
+            f"Macro {macro_step_index + 1}/{number_of_macro_steps} "
+            f"(sub={number_of_substeps_this_call}) "
+            f"outlet_pressure={outlet_pressure_value / 1e5:.3f} "
+            f"outlet_temperature~{outlet_average_temperature_value:.1f} "
+            f"elapsed={elapsed_simulation_time:.1f}s "
+            f"ETA={estimated_remaining_time:.1f}s"
+        )
 
+species_concentration_field = current_species_concentration_field
+temperature_field = current_temperature_field
 
-t_total = pytime.time() - t0
-print(f"Simulation done in {t_total:.1f}s")
+total_elapsed_time = pytime.time() - simulation_start_time
+print(f"Simulation done in {total_elapsed_time:.1f}s")
 
 # =========================
-# CPU transfer & plots
+# CPU transfer and plots
 # =========================
-u_cpu = cp.asnumpy(u)
-r_cpu = cp.asnumpy(r)
-z_cpu = cp.asnumpy(z)
-U_cpu = cp.asnumpy(U_profile)
-p_cpu = cp.asnumpy(p_z)
-T_cpu = cp.asnumpy(T_field)
-Z, R = np.meshgrid(z_cpu, r_cpu)
+species_concentration_field_cpu = cp.asnumpy(species_concentration_field)
+radial_cell_center_positions_cpu = cp.asnumpy(radial_cell_center_position)
+axial_cell_center_positions_cpu = cp.asnumpy(axial_cell_center_position)
+
+superficial_velocity_profile_cpu = cp.asnumpy(superficial_velocity_profile)
+pressure_profile_cpu = cp.asnumpy(pressure_profile)
+temperature_field_cpu = cp.asnumpy(temperature_field)
+
+axial_grid_coordinates, radial_grid_coordinates = np.meshgrid(
+    axial_cell_center_positions_cpu,
+    radial_cell_center_positions_cpu,
+)
 
 # Instantaneous rates at final state for selectivity plots
-_, _, _, _, _, r1, r2 = reaction_terms_T(u[0], u[1], T_field,
-                                         KE1, KE2, n1, n2, k01, k02, Ea1, Ea2,
-                                         ideal_gas_constant, catalyst_weight)
-r1_cpu = cp.asnumpy(r1)
-r2_cpu = cp.asnumpy(r2)
-denom = np.where((r1_cpu + r2_cpu) > 1e-20, r1_cpu + r2_cpu, np.nan)
-S_path1 = r1_cpu / denom
-S_path2 = r2_cpu / denom
+(
+    ethylene_source_term,
+    oxygen_source_term,
+    ethylene_oxide_source_term,
+    water_source_term,
+    carbon_dioxide_source_term,
+    main_reaction_rate,
+    side_reaction_rate,
+) = reaction_terms_T(
+    species_concentration_field[0],
+    species_concentration_field[1],
+    temperature_field,
+    Main_Reaction.KE1,
+    Side_Reaction.KE2,
+    Main_Reaction.n1,
+    Side_Reaction.n2,
+    Main_Reaction.k01,
+    Side_Reaction.k02,
+    Main_Reaction.Ea1,
+    Side_Reaction.Ea2,
+    Gas.ideal_gas_constant,
+    Catalyst.weight,
+)
 
-# Species fields
-fig, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
+main_reaction_rate_cpu = cp.asnumpy(main_reaction_rate)
+side_reaction_rate_cpu = cp.asnumpy(side_reaction_rate)
+
+reaction_rate_sum = main_reaction_rate_cpu + side_reaction_rate_cpu
+reaction_rate_sum_with_nan_for_zero = np.where(reaction_rate_sum > 1e-20, reaction_rate_sum, np.nan)
+
+main_path_selectivity_fraction = main_reaction_rate_cpu / reaction_rate_sum_with_nan_for_zero
+side_path_selectivity_fraction = side_reaction_rate_cpu / reaction_rate_sum_with_nan_for_zero
+
+# Species concentration fields
+figure, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
 axes = axes.ravel()
-for i, name in enumerate(species_names):
-    im = axes[i].pcolormesh(Z, R, u_cpu[i], shading='auto', cmap='plasma')
-    axes[i].set_title(f"Species: {name}")
-    axes[i].set_xlabel("z [m]"); axes[i].set_ylabel("r [m]")
-    cbar = plt.colorbar(im, ax=axes[i]); cbar.set_label("Concentration [mol/m³]")
-plt.suptitle("Final concentration fields (macro-step fused GPU)")
+
+for species_index, species_name in enumerate(Species.names):
+    image_handle = axes[species_index].pcolormesh(
+        axial_grid_coordinates,
+        radial_grid_coordinates,
+        species_concentration_field_cpu[species_index],
+        shading="auto",
+        cmap="plasma",
+    )
+    axes[species_index].set_title(f"Species: {species_name}")
+    axes[species_index].set_xlabel("Axial position")
+    axes[species_index].set_ylabel("Radial position")
+    colorbar_handle = plt.colorbar(image_handle, ax=axes[species_index])
+    colorbar_handle.set_label("Concentration")
+
+plt.suptitle("Final concentration fields")
 plt.show()
 
 # Temperature field
 plt.figure(figsize=(6, 4))
-im = plt.pcolormesh(Z, R, T_cpu, shading='auto', cmap='inferno')
-plt.colorbar(im, label="Temperature [K]")
-plt.xlabel("z [m]"); plt.ylabel("r [m]")
+temperature_image_handle = plt.pcolormesh(
+    axial_grid_coordinates,
+    radial_grid_coordinates,
+    temperature_field_cpu,
+    shading="auto",
+    cmap="inferno",
+)
+plt.colorbar(temperature_image_handle, label="Temperature")
+plt.xlabel("Axial position")
+plt.ylabel("Radial position")
 plt.title("Final temperature field")
 plt.show()
 
-# Velocity & pressure profiles
-plt.figure(figsize=(10,4))
-plt.plot(z_cpu, U_cpu); plt.grid(True, alpha=0.3)
-plt.xlabel("z [m]"); plt.ylabel("Superficial velocity U(z) [m/s]")
-plt.title("Axial velocity from Ergun"); plt.show()
+# Velocity profile
+plt.figure(figsize=(10, 4))
+plt.plot(axial_cell_center_positions_cpu, superficial_velocity_profile_cpu)
+plt.grid(True, alpha=0.3)
+plt.xlabel("Axial position")
+plt.ylabel("Superficial velocity")
+plt.title("Axial superficial velocity profile")
+plt.show()
 
-plt.figure(figsize=(10,4))
-plt.plot(z_cpu, p_cpu/1e5); plt.grid(True, alpha=0.3)
-plt.xlabel("z [m]"); plt.ylabel("Pressure [bar]")
-plt.title("Pressure profile (Ergun)"); plt.show()
+# Pressure profile
+plt.figure(figsize=(10, 4))
+plt.plot(axial_cell_center_positions_cpu, pressure_profile_cpu)
+plt.grid(True, alpha=0.3)
+plt.xlabel("Axial position")
+plt.ylabel("Pressure")
+plt.title("Pressure profile")
+plt.show()
 
-# Selectivity heatmap (Path 1)
-plt.figure(figsize=(12,5))
-im1 = plt.pcolormesh(Z, R, S_path1, shading='auto', cmap='viridis')
-plt.colorbar(im1, label="Path 1 fraction")
-plt.xlabel("z [m]"); plt.ylabel("r [m]")
-plt.title("Path selectivity to Ethylene Oxide (instantaneous)")
-plt.tight_layout(); plt.show()
+# Selectivity heatmap (main reaction path)
+plt.figure(figsize=(12, 5))
+selectivity_image_handle = plt.pcolormesh(
+    axial_grid_coordinates,
+    radial_grid_coordinates,
+    main_path_selectivity_fraction,
+    shading="auto",
+    cmap="viridis",
+)
+plt.colorbar(selectivity_image_handle, label="Main path selectivity fraction")
+plt.xlabel("Axial position")
+plt.ylabel("Radial position")
+plt.title("Instantaneous selectivity fraction to ethylene oxide")
+plt.tight_layout()
+plt.show()
